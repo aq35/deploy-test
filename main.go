@@ -105,7 +105,12 @@ const indexHTML = `<!DOCTYPE html>
       <a class="endpoint" href="/api/s3" target="_blank">
         <span class="method get">GET</span>
         <span class="path">/api/s3</span>
-        <span class="desc">S3 バケット一覧</span>
+        <span class="desc">S3 バケット内容</span>
+      </a>
+      <a class="endpoint" href="/api/s3/upload" target="_blank">
+        <span class="method get">GET</span>
+        <span class="path">/api/s3/upload</span>
+        <span class="desc">画像アップロード</span>
       </a>
     </div>
 
@@ -116,11 +121,22 @@ const indexHTML = `<!DOCTYPE html>
         <button class="btn" onclick="testAPI('/api/info')">📊 Info</button>
         <button class="btn green" onclick="testAPI('/api/hello?name=太郎')">👋 Hello</button>
         <button class="btn orange" onclick="testAPI('/api/db')">🗄️ DB接続</button>
-        <button class="btn" onclick="testAPI('/api/s3')" style="background:#805ad5">📦 S3一覧</button>
+        <button class="btn" onclick="testAPI('/api/s3')" style="background:#805ad5">📦 S3</button>
       </div>
       <div class="result" id="result" style="display:none">
         <pre id="result-text"></pre>
       </div>
+    </div>
+
+    <!-- S3 画像ギャラリー -->
+    <div class="card" id="gallery-card" style="display:none">
+      <h2>🖼️ S3 画像ギャラリー</h2>
+      <div style="margin-bottom:12px">
+        <input type="file" id="upload-file" accept="image/*" style="display:none">
+        <button class="btn green" onclick="document.getElementById('upload-file').click()">📤 画像をアップロード</button>
+        <button class="btn" onclick="loadGallery()" style="margin-left:4px">🔄 更新</button>
+      </div>
+      <div id="gallery" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px"></div>
     </div>
 
     <p class="time">現在時刻: <span id="clock"></span></p>
@@ -162,9 +178,59 @@ const indexHTML = `<!DOCTYPE html>
         var d2 = await r2.json();
         document.getElementById('s3-status').innerHTML = d2.error
           ? '<span class="status err">❌ ' + d2.error + '</span>'
-          : '<span class="status ok">✅ ' + (d2.buckets ? d2.buckets.length : 0) + ' バケット</span>';
+          : '<span class="status ok">✅ ' + d2.bucket + ' (' + (d2.count || 0) + ' files)</span>';
+        if (d2.bucket) loadGallery();
       } catch(e) { document.getElementById('s3-status').innerHTML = '<span class="status err">❌ エラー</span>'; }
     })();
+
+    // S3 画像ギャラリー
+    async function loadGallery() {
+      try {
+        var r = await fetch('/api/s3');
+        var d = await r.json();
+        if (!d.bucket) { return; }
+        document.getElementById('gallery-card').style.display = 'block';
+        var gallery = document.getElementById('gallery');
+        gallery.innerHTML = '';
+        if (!d.images || d.images.length === 0) {
+          gallery.innerHTML = '<p style="color:#a0aec0;font-size:13px">画像がありません。アップロードしてください。</p>';
+          return;
+        }
+        d.images.forEach(function(img) {
+          var div = document.createElement('div');
+          div.style.cssText = 'border-radius:12px;overflow:hidden;background:#f7fafc;position:relative';
+          div.innerHTML = '<img src="' + img.url + '" style="width:100%;height:150px;object-fit:cover" alt="' + img.key + '">'
+            + '<div style="padding:6px 8px;font-size:11px;color:#718096;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + img.key + '</div>'
+            + '<button onclick="deleteImage(\'' + img.key + '\')" style="position:absolute;top:4px;right:4px;background:rgba(0,0,0,.5);color:#fff;border:none;border-radius:50%;width:24px;height:24px;cursor:pointer;font-size:12px">✕</button>';
+          gallery.appendChild(div);
+        });
+      } catch(e) { console.error(e); }
+    }
+
+    // アップロード
+    document.getElementById('upload-file').addEventListener('change', async function(e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      try {
+        var r = await fetch('/api/s3/upload?filename=' + encodeURIComponent(file.name));
+        var d = await r.json();
+        if (d.error) { alert('エラー: ' + d.error); return; }
+        await fetch(d.upload_url, { method: 'PUT', body: file, headers: { 'Content-Type': file.type } });
+        e.target.value = '';
+        loadGallery();
+      } catch(err) { alert('アップロード失敗: ' + err.message); }
+    });
+
+    // 削除
+    async function deleteImage(key) {
+      if (!confirm(key + ' を削除しますか？')) return;
+      try {
+        var r = await fetch('/api/s3/delete?key=' + encodeURIComponent(key));
+        var d = await r.json();
+        if (d.error) alert('削除失敗: ' + d.error);
+        loadGallery();
+      } catch(err) { alert('削除失敗: ' + err.message); }
+    }
   </script>
 </body>
 </html>`
@@ -190,6 +256,8 @@ func main() {
 	mux.HandleFunc("/api/health", handleHealth)
 	mux.HandleFunc("/api/db", handleDB)
 	mux.HandleFunc("/api/s3", handleS3)
+	mux.HandleFunc("/api/s3/upload", handleS3Upload)
+	mux.HandleFunc("/api/s3/delete", handleS3Delete)
 
 	log.Printf("🌐 Go サーバー起動: http://0.0.0.0:%s\n", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
@@ -326,11 +394,27 @@ func handleDB(w http.ResponseWriter, r *http.Request) {
 
 // ==================== S3 接続テスト ====================
 
+func getS3Client(ctx context.Context) (*s3.Client, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("ap-northeast-1"))
+	if err != nil {
+		return nil, err
+	}
+	return s3.NewFromConfig(cfg), nil
+}
+
 func handleS3(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("ap-northeast-1"))
+	bucket := os.Getenv("S3_BUCKET")
+	if bucket == "" {
+		jsonResp(w, map[string]interface{}{
+			"error": "S3_BUCKET が設定されていません（環境変数を確認してください）",
+		})
+		return
+	}
+
+	client, err := getS3Client(ctx)
 	if err != nil {
 		jsonResp(w, map[string]interface{}{
 			"error": fmt.Sprintf("AWS設定読み込み失敗: %v", err),
@@ -338,60 +422,148 @@ func handleS3(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := s3.NewFromConfig(cfg)
-	result, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
+	listResult, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  &bucket,
+		MaxKeys: toInt32Ptr(100),
+	})
 	if err != nil {
 		jsonResp(w, map[string]interface{}{
-			"error": fmt.Sprintf("S3一覧取得失敗: %v", err),
+			"bucket": bucket,
+			"error":  fmt.Sprintf("S3一覧取得失敗: %v", err),
 		})
 		return
 	}
 
-	buckets := []map[string]string{}
-	for _, b := range result.Buckets {
-		buckets = append(buckets, map[string]string{
-			"name":    *b.Name,
-			"created": b.CreationDate.Format("2006-01-02"),
-		})
-	}
+	// Presigned URL を生成して画像を表示可能に
+	presignClient := s3.NewPresignClient(client)
+	images := []map[string]interface{}{}
+	objects := []map[string]interface{}{}
+	for _, obj := range listResult.Contents {
+		key := *obj.Key
+		item := map[string]interface{}{
+			"key":  key,
+			"size": *obj.Size,
+		}
+		objects = append(objects, item)
 
-	// 特定バケットの操作（S3_BUCKET が設定されている場合）
-	var bucketInfo map[string]interface{}
-	if bucket := os.Getenv("S3_BUCKET"); bucket != "" {
-		listResult, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:  &bucket,
-			MaxKeys: toInt32Ptr(10),
-		})
-		if err != nil {
-			bucketInfo = map[string]interface{}{
-				"bucket": bucket,
-				"error":  err.Error(),
-			}
-		} else {
-			objects := []map[string]interface{}{}
-			for _, obj := range listResult.Contents {
-				objects = append(objects, map[string]interface{}{
-					"key":  *obj.Key,
-					"size": obj.Size,
+		// 画像ファイル用に presigned URL を生成
+		if isImageKey(key) {
+			presigned, err := presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
+				Bucket: &bucket,
+				Key:    &key,
+			}, s3.WithPresignExpires(15*time.Minute))
+			if err == nil {
+				images = append(images, map[string]interface{}{
+					"key": key,
+					"url": presigned.URL,
 				})
-			}
-			bucketInfo = map[string]interface{}{
-				"bucket":  bucket,
-				"count":   listResult.KeyCount,
-				"objects": objects,
 			}
 		}
 	}
 
-	resp := map[string]interface{}{
-		"buckets": buckets,
-		"count":   len(buckets),
-		"message": fmt.Sprintf("✅ S3 接続成功！(%d バケット)", len(buckets)),
+	jsonResp(w, map[string]interface{}{
+		"bucket":  bucket,
+		"count":   len(objects),
+		"objects": objects,
+		"images":  images,
+		"message": fmt.Sprintf("✅ S3 バケット: %s (%d ファイル)", bucket, len(objects)),
+	})
+}
+
+// 画像アップロード用 presigned URL を返す
+func handleS3Upload(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	bucket := os.Getenv("S3_BUCKET")
+	if bucket == "" {
+		jsonResp(w, map[string]interface{}{"error": "S3_BUCKET が設定されていません"})
+		return
 	}
-	if bucketInfo != nil {
-		resp["bucket_detail"] = bucketInfo
+
+	filename := r.URL.Query().Get("filename")
+	if filename == "" {
+		jsonResp(w, map[string]interface{}{"error": "filename パラメータが必要です"})
+		return
 	}
-	jsonResp(w, resp)
+
+	key := "images/" + filename
+
+	client, err := getS3Client(ctx)
+	if err != nil {
+		jsonResp(w, map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	presignClient := s3.NewPresignClient(client)
+	presigned, err := presignClient.PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}, s3.WithPresignExpires(15*time.Minute))
+	if err != nil {
+		jsonResp(w, map[string]interface{}{"error": fmt.Sprintf("Presigned URL生成失敗: %v", err)})
+		return
+	}
+
+	jsonResp(w, map[string]interface{}{
+		"upload_url": presigned.URL,
+		"key":        key,
+		"bucket":     bucket,
+	})
+}
+
+// S3 オブジェクト削除
+func handleS3Delete(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	bucket := os.Getenv("S3_BUCKET")
+	if bucket == "" {
+		jsonResp(w, map[string]interface{}{"error": "S3_BUCKET が設定されていません"})
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		jsonResp(w, map[string]interface{}{"error": "key パラメータが必要です"})
+		return
+	}
+
+	client, err := getS3Client(ctx)
+	if err != nil {
+		jsonResp(w, map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	_, err = client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		jsonResp(w, map[string]interface{}{"error": fmt.Sprintf("削除失敗: %v", err)})
+		return
+	}
+
+	jsonResp(w, map[string]interface{}{
+		"deleted": key,
+		"message": "✅ 削除しました",
+	})
+}
+
+// 画像ファイル判定
+func isImageKey(key string) bool {
+	ext := ""
+	for i := len(key) - 1; i >= 0; i-- {
+		if key[i] == '.' {
+			ext = key[i:]
+			break
+		}
+	}
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".ico":
+		return true
+	}
+	return false
 }
 
 // ==================== Helpers ====================
